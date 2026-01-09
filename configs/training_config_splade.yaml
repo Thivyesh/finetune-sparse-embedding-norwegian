@@ -1,0 +1,238 @@
+# Sparse Encoder Training Configuration
+# Inference-free SPLADE architecture with multi-dataset round-robin sampling
+# See this guide: https://huggingface.co/blog/train-sparse-encoder
+# ============================================================================
+# MODEL CONFIGURATION
+# ============================================================================
+model:
+  # Base model: Start with small model for fast iteration
+  # Options: ltg/norbert3-xs (42M), ltg/norbert3-base (124M), ltg/norbert4-base (150M)
+  base_model: "ltg/norbert3-base"
+  
+  # Model type: "inference-free-splade" (recommended) or "splade"
+  architecture: "inference-free-splade"
+  
+  # Pooling strategy for SPLADE
+  pooling_strategy: "max"  # max pooling over token embeddings
+  
+  # For inference-free SPLADE: separate query/document encoding
+  use_router: true
+  freeze_static_embedding: false  # Allow query embeddings to train
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  output_dir: "models/splade-norbert3-multidataset"
+  
+  # Training duration
+  num_train_epochs: 1
+  max_steps: -1  # -1 means use num_train_epochs
+  
+  # Batch sizes
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 1
+  
+  # Learning rates
+  learning_rate: 0.00002  # Base learning rate for MLM transformer (2e-5)
+  query_learning_rate: 0.001  # Higher LR for static query embeddings (1e-3, inference-free only)
+  
+  # Optimization
+  warmup_ratio: 0.1  # 10% warmup
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  # Precision (M4 Max supports bf16 which is better than fp16 for training)
+  fp16: false  # Don't use fp16 if you have bf16 support
+  bf16: true   # USE THIS on M-series chips (M3/M4) - faster and more stable than fp32
+  
+  # Sequence length
+  max_seq_length: 256  # Start conservative, can increase to 512
+  
+  # Batch sampling
+  batch_sampler: "no_duplicates"  # Important for in-batch negatives
+  
+  # Evaluation strategy
+  eval_strategy: "steps"
+  eval_steps: 1000
+  logging_steps: 100
+  
+  # Saving strategy
+  save_strategy: "steps"
+  save_steps: 1000
+  save_total_limit: 1  # Keep only 1 checkpoint (saves disk space)
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_NanoBEIR_mean_dot_ndcg@10"  # Use NDCG@10 (higher is better)
+  greater_is_better: true  # NDCG@10 should be maximized
+  # TensorBoard logging directory (relative to repo or absolute)
+  logging_dir: "runs"  # will be resolved under output_dir if relative
+  
+  # Push to HuggingFace Hub after each checkpoint
+  push_to_hub: true
+  hub_model_id: "thivy/splade-norbert3-scandinavian-multidataset"  # Your HF username/model-name
+  hub_strategy: "checkpoint"  # Push each checkpoint (or "end" for only final model)
+  hub_private_repo: false  # Set true for private model
+  
+  # Early stopping (optional) - stops training if metric doesn't improve
+  # early_stopping_patience: 5  # Stop if no improvement for 5 evaluations (5000 steps)
+  # early_stopping_threshold: 0.001  # Minimum change to qualify as improvement
+  
+  # Logging
+  run_name: "splade-norbert3-multidataset"
+  report_to: ["tensorboard", "mlflow"]  # Options: "tensorboard", "mlflow", "wandb"
+  
+  # Data loading (set to 0 for macOS MPS to avoid multiprocessing issues)
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+
+# ============================================================================
+# MLFLOW CONFIGURATION
+# ============================================================================
+mlflow:
+  # MLflow tracking URI (where to store runs)
+  # Options:
+  #   - "mlruns" (default): Local directory
+  #   - "file:///path/to/mlruns": Absolute path
+  #   - "http://localhost:5000": Remote MLflow server
+  tracking_uri: "mlruns"
+  
+  # Experiment name
+  experiment_name: "sparse-encoder-scandinavian"
+  
+  # Tags (optional)
+  tags:
+    project: "scandinavian-sparse-embeddings"
+    framework: "sentence-transformers"
+
+# ============================================================================
+# LOSS CONFIGURATION
+# ============================================================================
+loss:
+  # Main loss: SpladeLoss wrapper with regularization
+  type: "splade_loss"
+  
+  # Inner loss for contrastive learning
+  inner_loss: "sparse_multiple_negatives_ranking_loss"
+  
+  # Sparsity regularization (L1 penalty on active dimensions)
+  # Higher weight = sparser embeddings = less storage but potentially lower performance
+  # Query regularization: 0 for inference-free (already sparse), 3e-4 to 5e-4 for regular SPLADE
+  query_regularizer_weight: 0  # 0 for inference-free SPLADE
+  
+  # Document regularization: Controls document embedding sparsity
+  # Target: 5-10% non-zero dimensions (1500-3000 active dims out of 30k vocab)
+  document_regularizer_weight: 0.003  # 3e-3 - Start here, tune based on sparsity
+
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+datasets:
+  # Multi-dataset sampling strategy
+  # "round_robin": Equal representation from each dataset
+  # "proportional": Sample proportionally to dataset size
+  sampling_strategy: "round_robin"
+  
+  # Dataset 1: NLI Data
+  nli:
+    enabled: true
+    source: "Fremtind/all-nli-norwegian"
+    languages: ["norwegian"]
+    split_ratio: [0.98, 0.01, 0.01]  # train/dev/test
+  
+  # Dataset 2: Scandi QA
+  scandi_qa:
+    enabled: true
+    use_norquad: true
+    use_openbookqa: true
+    use_scandiqa: true
+    use_supervised_da: true
+    use_paws: true
+    scandiqa_languages: ["no", "da", "sv"]
+    paws_data_dir: "data/paws-x/x-final"  # Will auto-download if not present
+  
+  # Dataset 3: DDSC Retrieval
+  ddsc:
+    enabled: true
+    languages: ["norwegian", "danish", "swedish"]
+    tasks: null  # null = all tasks
+    split_ratio: [0.98, 0.01, 0.01]
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  # Evaluator type during training
+  evaluator: "sparse_nanobeir"  # Fast evaluation on small BEIR subset
+  
+  # Datasets to evaluate on during training
+  nanobeir_datasets: ["msmarco", "nfcorpus"]
+  
+  # Full MTEB evaluation after training (separate script)
+  mteb_tasks: ["NorQuAD", "SNL"]
+  
+  # Monitor sparsity metrics
+  track_sparsity: true
+  log_decoded_samples: 10  # Log top-10 active tokens for sample embeddings
+
+# ============================================================================
+# INFERENCE-FREE SPLADE SPECIFIC
+# ============================================================================
+router:
+  # Map dataset columns to query/document routes
+  # All datasets are reformatted to use anchor/positive/negative columns
+  # anchor = query (goes through SparseStaticEmbedding - fast inference)
+  # positive/negative = documents (goes through MLMTransformer + SpladePooling - offline indexing)
+  mapping:
+    anchor: "query"        # Queries use static embedding (inference-free)
+    positive: "document"   # Positive docs use full MLM transformer
+    negative: "document"   # Negative docs use full MLM transformer
+  
+  # Learning rate mapping for different modules
+  # Pattern matching on parameter names: Query path (SparseStaticEmbedding) needs higher LR
+  # The actual parameter name in Router is: 0.sub_modules.query.0.weight
+  learning_rate_patterns:
+    ".*\\.query\\..*": 0.001  # High LR for query path (SparseStaticEmbedding) = 1e-3
+    # All other parameters (document path MLM) use default learning_rate (2e-5)
+
+# ============================================================================
+# MODEL CARD CONFIGURATION
+# ============================================================================
+model_card:
+  language: ["no", "da", "sv"]
+  license: "mit"
+  library_name: "sentence-transformers"
+  tags:
+    - "sparse-encoder"
+    - "splade"
+    - "norwegian"
+    - "danish"
+    - "swedish"
+    - "scandinavian"
+    - "multilingual"
+    - "information-retrieval"
+  
+  model_name: "Inference-free SPLADE NorBERT trained on Multi-dataset Norwegian/Scandinavian"
+  
+  datasets_used:
+    - "Fremtind/all-nli-norwegian"
+    - "NorQuAD"
+    - "OpenBookQA"
+    - "ScandiQA"
+    - "DDSC Nordic Embedding Training Data"
+    - "PAWS-X Norwegian"
+
+# ============================================================================
+# HARDWARE CONFIGURATION  
+# ============================================================================
+hardware:
+  # Device - MPS for M-series Macs (M1/M2/M3/M4)
+  device: "mps"  # "cuda" for NVIDIA GPUs, "cpu" for CPU-only, "mps" for Mac M-series
+  
+  # Memory optimization - Trades compute for memory (slower but uses less VRAM)
+  # Sparse models are lightweight, usually don't need this
+  gradient_checkpointing: false
+  
+  # Distributed training (only if multiple GPUs available)
+  distributed: false
+  world_size: 1

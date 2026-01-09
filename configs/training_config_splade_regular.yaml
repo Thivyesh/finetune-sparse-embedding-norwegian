@@ -1,0 +1,172 @@
+# Regular SPLADE Training Configuration (SIMPLER - NO ROUTER)
+# Uses same MLM transformer for both queries and documents
+# Better accuracy, slightly slower query inference
+# ============================================================================
+# MODEL CONFIGURATION
+# ============================================================================
+model:
+  base_model: "ltg/norbert3-base"
+  
+  # Model type: "splade" for regular SPLADE (simpler, no router)
+  architecture: "splade"
+  
+  # Pooling strategy
+  pooling_strategy: "max"
+  
+  # Regular SPLADE doesn't use router
+  use_router: false
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  output_dir: "models/splade-norbert3-regular-multidataset"
+  
+  # Training duration
+  num_train_epochs: 1
+  
+  # Batch sizes
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 1
+  
+  # Learning rate - SINGLE learning rate for all parameters (simpler!)
+  learning_rate: 0.00002  # 2e-5
+  
+  # Optimization
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  # Precision (M4 Max supports bf16)
+  fp16: false
+  bf16: true  # USE THIS on M-series chips - faster and more stable
+  
+  # Sequence length
+  max_seq_length: 256
+  
+  # Batch sampling
+  batch_sampler: "no_duplicates"
+  
+  # Evaluation
+  eval_strategy: "steps"
+  eval_steps: 1000
+  logging_steps: 100
+  
+  # Saving
+  save_strategy: "steps"
+  save_steps: 1000
+  save_total_limit: 1  # Keep only 1 checkpoint (saves disk space)
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_NanoBEIR_mean_dot_ndcg@10"  # Use NDCG@10 (higher is better)
+  greater_is_better: true  # NDCG@10 should be maximized
+  
+  # Push to HuggingFace Hub after each checkpoint
+  push_to_hub: true
+  hub_model_id: "thivy/splade-regular-norbert3-scandinavian-multidataset"  # Your HF username/model-name
+  hub_strategy: "checkpoint"  # Push each checkpoint (or "end" for only final model)
+  hub_private_repo: false  # Set true for private model
+  
+  # Logging
+  run_name: "splade-norbert3-regular-multidataset"
+  report_to: ["tensorboard", "mlflow"]
+  
+  # Data loading (set to 0 for macOS MPS to avoid multiprocessing issues)
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+
+# ============================================================================
+# MLFLOW CONFIGURATION
+# ============================================================================
+mlflow:
+  tracking_uri: "mlruns"
+  experiment_name: "sparse-encoder-scandinavian"
+  tags:
+    project: "scandinavian-sparse-embeddings"
+    framework: "sentence-transformers"
+    architecture: "regular-splade"
+
+# ============================================================================
+# LOSS CONFIGURATION
+# ============================================================================
+loss:
+  type: "splade_loss"
+  inner_loss: "sparse_multiple_negatives_ranking_loss"
+  
+  # Sparsity regularization for BOTH queries and documents
+  # Regular SPLADE uses regularization on both (unlike inference-free where queries are already sparse)
+  query_regularizer_weight: 0.0005  # 5e-4 - make queries sparse
+  document_regularizer_weight: 0.003  # 3e-3 - make documents sparse
+
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+datasets:
+  sampling_strategy: "round_robin"
+  
+  # Dataset 1: NLI Data
+  nli:
+    enabled: true
+    source: "Fremtind/all-nli-norwegian"
+    languages: ["norwegian"]
+    split_ratio: [0.98, 0.01, 0.01]
+  
+  # Dataset 2: Scandi QA
+  scandi_qa:
+    enabled: true
+    use_norquad: true
+    use_openbookqa: true
+    use_scandiqa: true
+    use_supervised_da: true
+    use_paws: true
+    scandiqa_languages: ["no", "da", "sv"]
+    paws_data_dir: "data/paws-x/x-final"
+  
+  # Dataset 3: DDSC Retrieval
+  ddsc:
+    enabled: true
+    languages: ["norwegian", "danish", "swedish"]
+    tasks: null
+    split_ratio: [0.98, 0.01, 0.01]
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  evaluator: "sparse_nanobeir"
+  nanobeir_datasets: ["msmarco", "nfcorpus"]
+  mteb_tasks: ["NorQuAD", "SNL"]
+  track_sparsity: true
+  log_decoded_samples: 10
+
+# ============================================================================
+# MODEL CARD CONFIGURATION
+# ============================================================================
+model_card:
+  language: ["no", "da", "sv"]
+  license: "mit"
+  library_name: "sentence-transformers"
+  tags:
+    - "sparse-encoder"
+    - "splade"
+    - "regular-splade"
+    - "norwegian"
+    - "danish"
+    - "swedish"
+  model_name: "Regular SPLADE NorBERT trained on Multi-dataset Norwegian/Scandinavian"
+  datasets_used:
+    - "Fremtind/all-nli-norwegian"
+    - "NorQuAD"
+    - "OpenBookQA"
+    - "ScandiQA"
+    - "DDSC Nordic Embedding Training Data"
+    - "PAWS-X Norwegian"
+
+# ============================================================================
+# HARDWARE CONFIGURATION
+# ============================================================================
+hardware:
+  device: "mps"
+  gradient_checkpointing: false
+  distributed: false
+  world_size: 1

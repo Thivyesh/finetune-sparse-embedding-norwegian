@@ -1,0 +1,181 @@
+# CSR (Contrastive Sparse Representation) Training Configuration
+# Sparsifies existing dense embedding model by adding SparseAutoEncoder
+# Uses your finetuned dense model: thivy/norbert4-base-scandinavian-embedding
+# ============================================================================
+# MODEL CONFIGURATION
+# ============================================================================
+model:
+  # Base model: Your finetuned dense embedding model
+  base_model: "thivy/norbert4-base-scandinavian-embedding"
+  
+  # Model type: "csr" for Contrastive Sparse Representation
+  architecture: "csr"
+  
+  # CSR-specific hyperparameters
+  # k = number of top values to keep (active dimensions)
+  # Higher k = more dense but better performance
+  csr_k: 256  # 256 active dimensions out of embedding_dim (usually 768 or 1024)
+  
+  # k_aux = number of top values for auxiliary loss
+  csr_k_aux: 512
+  
+  # hidden_dim = dimension of sparse autoencoder hidden layer
+  # Typically 4x the input dimension
+  csr_hidden_dim: 4096  # 4 * 1024 for norbert4-base (1024-dim embeddings)
+  
+  # No router for CSR
+  use_router: false
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  output_dir: "models/csr-norbert4-scandinavian"
+  
+  # Training duration - CSR trains faster than SPLADE (only training autoencoder)
+  num_train_epochs: 1
+  
+  # Batch sizes
+  per_device_train_batch_size: 32  # Can use larger batches for CSR
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 1
+  
+  # Learning rate - CSR typically uses higher LR since only training autoencoder
+  learning_rate: 0.0001  # 1e-4 (higher than SPLADE)
+  
+  # Optimization
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  # Precision - Enable bf16 for M4 Max
+  fp16: false
+  bf16: true  # M4 Max supports bf16
+  
+  # Sequence length
+  max_seq_length: 512  # Can use longer since base model is already trained
+  
+  # Batch sampling
+  batch_sampler: "no_duplicates"
+  
+  # Evaluation
+  eval_strategy: "steps"
+  eval_steps: 500  # Evaluate more frequently
+  logging_steps: 100
+  
+  # Saving
+  save_strategy: "steps"
+  save_steps: 500
+  save_total_limit: 1  # Keep only 1 checkpoint (saves disk space)
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_NanoBEIR_mean_dot_ndcg@10"  # Use NDCG@10 (higher is better)
+  greater_is_better: true  # NDCG@10 should be maximized
+  
+  # Push to HuggingFace Hub after each checkpoint
+  push_to_hub: true
+  hub_model_id: "thivy/csr-norbert4-scandinavian"  # Your HF username/model-name
+  hub_strategy: "checkpoint"  # Push each checkpoint (or "end" for only final model)
+  hub_private_repo: false  # Set true for private model
+  
+  # Logging
+  run_name: "csr-norbert4-scandinavian"
+  report_to: ["tensorboard", "mlflow"]
+  
+  # Data loading - Set to 0 for Mac MPS (multiprocessing issue)
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+
+# ============================================================================
+# MLFLOW CONFIGURATION
+# ============================================================================
+mlflow:
+  tracking_uri: "mlruns"
+  experiment_name: "sparse-encoder-scandinavian"
+  tags:
+    project: "scandinavian-sparse-embeddings"
+    framework: "sentence-transformers"
+    architecture: "csr"
+
+# ============================================================================
+# LOSS CONFIGURATION
+# ============================================================================
+loss:
+  # CSR uses CSRLoss (wrapper with auxiliary loss for dead neurons)
+  type: "csr_loss"
+  inner_loss: "sparse_multiple_negatives_ranking_loss"
+  
+  # Auxiliary loss weight (for preventing dead neurons in autoencoder)
+  aux_loss_weight: 0.1  # Balance between main loss and auxiliary loss
+
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+datasets:
+  sampling_strategy: "round_robin"
+  
+  # Dataset 1: NLI Data
+  nli:
+    enabled: true
+    source: "Fremtind/all-nli-norwegian"
+    languages: ["norwegian"]
+    split_ratio: [0.98, 0.01, 0.01]
+  
+  # Dataset 2: Scandi QA
+  scandi_qa:
+    enabled: true
+    use_norquad: true
+    use_openbookqa: true
+    use_scandiqa: true
+    use_supervised_da: true
+    use_paws: true
+    scandiqa_languages: ["no", "da", "sv"]
+    paws_data_dir: "data/paws-x/x-final"
+  
+  # Dataset 3: DDSC Retrieval
+  ddsc:
+    enabled: true
+    languages: ["norwegian", "danish", "swedish"]
+    tasks: null
+    split_ratio: [0.98, 0.01, 0.01]
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  evaluator: "sparse_nanobeir"
+  nanobeir_datasets: ["msmarco", "nfcorpus"]
+  mteb_tasks: ["NorQuAD", "SNL"]
+  track_sparsity: true
+  log_decoded_samples: 10
+
+# ============================================================================
+# MODEL CARD CONFIGURATION
+# ============================================================================
+model_card:
+  language: ["no", "da", "sv"]
+  license: "mit"
+  library_name: "sentence-transformers"
+  tags:
+    - "sparse-encoder"
+    - "csr"
+    - "contrastive-sparse-representation"
+    - "norwegian"
+    - "danish"
+    - "swedish"
+  model_name: "CSR NorBERT4 Scandinavian (sparsified dense model)"
+  datasets_used:
+    - "Fremtind/all-nli-norwegian"
+    - "NorQuAD"
+    - "OpenBookQA"
+    - "ScandiQA"
+    - "DDSC Nordic Embedding Training Data"
+    - "PAWS-X Norwegian"
+
+# ============================================================================
+# HARDWARE CONFIGURATION
+# ============================================================================
+hardware:
+  device: "mps"  # Mac M-series GPU
+  gradient_checkpointing: false  # Usually not needed for CSR (lightweight)
+  distributed: false
+  world_size: 1

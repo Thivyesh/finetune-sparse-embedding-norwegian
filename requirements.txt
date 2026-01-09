@@ -1,0 +1,23 @@
+# Dependencies for Sparse Encoder Training
+
+# Core dependencies
+sentence-transformers>=3.0.0  # For sparse encoder support
+datasets>=2.14.0
+transformers>=4.41.0
+torch>=2.0.0
+
+# Evaluation
+mteb>=1.12.0
+
+# Utilities
+pyyaml>=6.0
+scikit-learn>=1.3.0
+
+# Logging & monitoring (optional)
+tensorboard>=2.14.0
+mlflow>=2.9.0  # MLflow experiment tracking
+# wandb>=0.15.0  # Uncomment if you want W&B logging
+
+# Development (optional)
+# jupyter>=1.0.0
+# ipython>=8.0.0
