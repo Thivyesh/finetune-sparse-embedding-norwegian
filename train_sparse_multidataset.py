@@ -265,7 +265,6 @@ def load_datasets(config: dict) -> Dict[str, DatasetDict]:
 def create_training_args(config: dict) -> SparseEncoderTrainingArguments:
     """Create training arguments from config."""
     train_config = config['training']
-    loss_config = config['loss']
     router_config = config.get('router', {})
     hardware_config = config.get('hardware', {})
     
@@ -643,7 +642,13 @@ def main(config_path: str):
     logger.info("\n" + "=" * 80)
     logger.info("STARTING TRAINING")
     logger.info("=" * 80)
-    trainer.train()
+    # Support resuming from a checkpoint specified in the config (or via CLI flags)
+    resume_ckpt = config['training'].get('resume_from_checkpoint') if 'training' in config else None
+    if resume_ckpt:
+        logger.info(f"Resuming training from checkpoint: {resume_ckpt}")
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+    else:
+        trainer.train()
     
     # Evaluate on test set
     if evaluator:
@@ -694,11 +699,58 @@ if __name__ == "__main__":
         type=str,
         help="Path to training configuration YAML file",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="If set, automatically resume from the latest checkpoint under training.output_dir",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Explicit path to a checkpoint directory to resume from. If provided, overrides --resume",
+    )
     
     args = parser.parse_args()
     
     if not os.path.exists(args.config):
         logger.error(f"Config file not found: {args.config}")
         sys.exit(1)
-    
+
+    # Load config early so we can resolve output_dir for resume detection
+    cfg = load_config(args.config)
+
+    # Determine resume checkpoint if requested
+    resume_checkpoint = None
+    if args.resume_from:
+        # Explicit path provided by user
+        resume_checkpoint = args.resume_from
+        logger.info(f"Resuming from explicit checkpoint: {resume_checkpoint}")
+    elif args.resume:
+        # Auto-detect latest checkpoint under output_dir
+        out_dir = cfg['training'].get('output_dir')
+        if out_dir and os.path.isdir(out_dir):
+            # Look for checkpoint-* directories
+            candidates = [d for d in os.listdir(out_dir) if d.startswith('checkpoint-')]
+            if candidates:
+                # Sort by numeric suffix if possible
+                def _ckpt_key(name):
+                    try:
+                        return int(name.split('-')[-1])
+                    except Exception:
+                        return 0
+
+                candidates.sort(key=_ckpt_key)
+                latest = candidates[-1]
+                resume_checkpoint = os.path.join(out_dir, latest)
+                logger.info(f"Auto-detected latest checkpoint: {resume_checkpoint}")
+            else:
+                logger.warning(f"No checkpoints found under output_dir ({out_dir}) to resume from")
+        else:
+            logger.warning(f"Output directory does not exist or is not a directory: {out_dir}")
+
+    # Inject resume_checkpoint into config so main() can use it
+    if resume_checkpoint:
+        cfg.setdefault('training', {})['resume_from_checkpoint'] = resume_checkpoint
+
     main(args.config)
