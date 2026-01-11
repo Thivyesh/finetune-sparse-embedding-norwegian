@@ -1,8 +1,7 @@
-# Sparse Embedding Training for Norwegian/Scandinavian Languages# Sparse Embedding Training for Norwegian/Scandinavian Languages
+# Sparse Embedding Training for Norwegian/Scandinavian Languages
 
 
-
-Train state-of-the-art sparse embedding models (SPLADE, Inference-free SPLADE, CSR) for Norwegian, Danish, and Swedish using multi-dataset training.Train SPLADE sparse encoder models for Norwegian, Danish, and Swedish using multi-dataset training with round-robin sampling.
+Train state-of-the-art sparse embedding models (SPLADE, Inference-free SPLADE, CSR) for Norwegian, Danish, and Swedish using multi-dataset training. Train SPLADE sparse encoder models for Norwegian, Danish, and Swedish using multi-dataset training with round-robin sampling.
 
 
 
@@ -12,13 +11,8 @@ Train state-of-the-art sparse embedding models (SPLADE, Inference-free SPLADE, C
 
 
 
-- **3 Sparse Architectures**: Regular SPLADE, Inference-free SPLADE, CSRThis project trains sparse embedding models (SPLADE architecture) using the same high-quality Scandinavian datasets from the dense embedding training project. Sparse models offer:
+- **3 Sparse Architectures**: Regular SPLADE, Inference-free SPLADE, CSR. This project trains sparse embedding models (SPLADE architecture) using high-quality Scandinavian datasets. Sparse models offer:
 [comment]: <> (Clean README: accurate project overview, conformed to current repo layout and commands)
-# Sparse Embedding Training for Norwegian / Scandinavian languages
-
-Train state-of-the-art sparse embedding models (SPLADE, Inference-free SPLADE, CSR) for Norwegian, Danish and Swedish using multi-dataset training.
-
-This repository contains training and evaluation scripts, configuration files and utilities for training sparse encoders on a mix of NLI, QA and retrieval datasets (~1.6M samples total).
 
 ## Highlights
 
@@ -63,7 +57,7 @@ huggingface-cli login
 
 3) Train a model
 
-The training scripts live in `scripts/`. Example runs:
+The canonical training script is `train_sparse_multidataset.py` at the repository root. Example runs:
 
 ```bash
 # Regular SPLADE (best accuracy)
@@ -97,6 +91,26 @@ Use the evaluation script in `scripts/` to run MTEB or NanoBEIR-style evaluation
 ```bash
 uv run python scripts/evaluate_sparse_mteb.py --model-path models/your-checkpoint/final
 ```
+
+### Resuming training
+
+You can resume interrupted training from a checkpoint saved under the configured `training.output_dir`.
+
+- Automatically resume from the latest checkpoint:
+
+```bash
+uv run python train_sparse_multidataset.py --resume configs/training_config_splade.yaml
+```
+
+- Resume from an explicit checkpoint directory:
+
+```bash
+uv run python train_sparse_multidataset.py --resume-from models/your-model/checkpoint-1000 configs/training_config_splade.yaml
+```
+
+Notes:
+- The script will look for directories named `checkpoint-<num>` under the configured `training.output_dir` and pick the one with the highest numeric suffix when `--resume` is used.
+- If no checkpoints are found, training will start from scratch and a warning will be logged.
 
 ## Configuration
 
