@@ -16,6 +16,7 @@ import sys
 import yaml
 from typing import Dict, Optional
 import mlflow
+import torch
 
 from datasets import DatasetDict
 from sentence_transformers import (
@@ -60,6 +61,67 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def setup_hardware(config: dict) -> str:
+    """
+    Configure hardware optimizations based on the available device.
+
+    For NVIDIA CUDA GPUs (especially H100):
+      - Enable TF32 for ~3x faster FP32 matrix multiplications
+      - Enable cuDNN benchmark mode for optimized convolution algorithms
+      - Log GPU properties for debugging
+
+    For Apple MPS (Mac M-series):
+      - Basic MPS setup
+
+    Returns:
+        The device string to use ("cuda", "mps", or "cpu")
+    """
+    hardware_config = config.get('hardware', {})
+    requested_device = hardware_config.get('device', 'auto')
+
+    # Auto-detect device
+    if requested_device == 'auto':
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
+    else:
+        device = requested_device
+
+    logger.info(f"Using device: {device}")
+
+    if device == 'cuda':
+        # Log GPU info
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        logger.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+
+        # Enable TF32 for Ampere+ GPUs (A100, H100, etc.)
+        # TF32 uses 19-bit precision for FP32 matmuls — ~3x faster, negligible accuracy loss
+        if hardware_config.get('tf32', True):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logger.info("TF32 enabled for CUDA matmul and cuDNN")
+
+        # Enable cuDNN benchmark for optimal convolution algorithm selection
+        torch.backends.cudnn.benchmark = True
+        logger.info("cuDNN benchmark mode enabled")
+
+        # Set float32 matmul precision to 'high' for Tensor Core usage
+        torch.set_float32_matmul_precision('high')
+        logger.info("Float32 matmul precision set to 'high'")
+
+    elif device == 'mps':
+        logger.info("Using Apple MPS backend")
+
+    else:
+        logger.info("Using CPU — training will be slow")
+
+    return device
 
 
 def load_config(config_path: str) -> dict:
@@ -145,10 +207,22 @@ def create_sparse_model(config: dict) -> SparseEncoder:
         
     else:
         # Regular SPLADE: MLMTransformer + SpladePooling
-        model = SparseEncoder(
+        # For regular SPLADE, load MLMTransformer and add pooling
+        mlm_transformer = MLMTransformer.load(
             base_model,
+            trust_remote_code=True,
+            tokenizer_kwargs={"model_max_length": config['training']['max_seq_length']}
+        )
+        
+        splade_pooling = SpladePooling(
+            pooling_strategy=model_config.get('pooling_strategy', 'max'),
+            word_embedding_dimension=mlm_transformer.get_sentence_embedding_dimension()
+        )
+        
+        model = SparseEncoder(
+            modules=[mlm_transformer, splade_pooling],
+            similarity_fn_name="dot",
             model_card_data=create_model_card_data(config),
-            model_kwargs={"trust_remote_code": True}
         )
         
         logger.info("Created regular SPLADE model")
@@ -309,9 +383,9 @@ def create_training_args(config: dict) -> SparseEncoderTrainingArguments:
         eval_strategy=train_config.get('eval_strategy', 'steps'),
         eval_steps=train_config.get('eval_steps', 1000),
         
-    # Logging
-    logging_steps=train_config.get('logging_steps', 100),
-    logging_dir=train_config.get('logging_dir', None),
+        # Logging
+        logging_steps=train_config.get('logging_steps', 100),
+        logging_dir=train_config.get('logging_dir', None),
         run_name=train_config.get('run_name', 'splade-training'),
         report_to=train_config.get('report_to', ['tensorboard']),
         
@@ -329,9 +403,13 @@ def create_training_args(config: dict) -> SparseEncoderTrainingArguments:
         hub_strategy=train_config.get('hub_strategy', 'checkpoint'),  # "checkpoint" or "end"
         hub_private_repo=train_config.get('hub_private_repo', False),
                 
-        # Data loading (MUST be 0 on macOS MPS to avoid multiprocessing errors)
+        # Data loading
         dataloader_num_workers=train_config.get('dataloader_num_workers', 0),
         dataloader_pin_memory=train_config.get('dataloader_pin_memory', False),
+        dataloader_prefetch_factor=train_config.get('dataloader_prefetch_factor', None),
+
+        # Torch compile — fuses kernels, reduces overhead (H100/Ampere+ benefit most)
+        torch_compile=train_config.get('torch_compile', False),
     )
     
     # Add router mapping if using inference-free SPLADE
@@ -559,14 +637,14 @@ def log_dataset_stats_to_mlflow(datasets: Dict[str, DatasetDict]):
     logger.info("Logged dataset statistics to MLflow")
 
 
-def main(config_path: str):
+def main(config: dict):
     """Main training function."""
     logger.info("=" * 80)
     logger.info("SPARSE ENCODER MULTI-DATASET TRAINING")
     logger.info("=" * 80)
     
-    # Load config
-    config = load_config(config_path)
+    # Setup hardware optimizations (TF32, cuDNN benchmark, etc.)
+    device = setup_hardware(config)
     
     # Setup MLflow experiment tracking
     setup_mlflow(config)
@@ -753,4 +831,4 @@ if __name__ == "__main__":
     if resume_checkpoint:
         cfg.setdefault('training', {})['resume_from_checkpoint'] = resume_checkpoint
 
-    main(args.config)
+    main(cfg)

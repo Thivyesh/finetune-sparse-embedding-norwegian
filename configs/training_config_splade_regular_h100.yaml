@@ -1,0 +1,169 @@
+# Regular SPLADE Training Configuration — H100 GPU Optimized (NO ROUTER)
+# Uses same MLM transformer for both queries and documents
+# Better accuracy, slightly slower query inference
+# Optimized for NVIDIA H100 NVL (96GB VRAM, CUDA 12.2, Compute Capability 9.0)
+# ============================================================================
+# MODEL CONFIGURATION
+# ============================================================================
+model:
+  base_model: "ltg/norbert4-large"
+  architecture: "splade"
+  pooling_strategy: "max"
+  use_router: false
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  output_dir: "models/splade-norbert4-large-regular-multidataset"
+  
+  # Training duration
+  num_train_epochs: 1
+  
+  # Batch sizes — norbert4-large (355M) safe for single H100
+  # Memory: 355M params (~800MB) + ~5KB per token per sample
+  # 512 tokens × 5KB × batch=16 ≈ ~40GB on 96GB H100 — comfortable
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 1
+  
+  # Learning rate
+  learning_rate: 0.00002  # 2e-5
+  
+  # Optimization
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  # Precision — H100 has hardware BF16 Tensor Cores
+  fp16: false
+  bf16: true
+  
+  # Torch compile — disabled due to variable sequence lengths causing recompilation
+  torch_compile: false
+  
+  # Sequence length — NorBERT4-large trained on 16384 tokens
+  # Using 512 for safe single H100 training, can go to 1024+ on multi-H100
+  max_seq_length: 512
+  
+  # Batch sampling
+  batch_sampler: "no_duplicates"
+  
+  # Evaluation
+  eval_strategy: "steps"
+  eval_steps: 1000
+  logging_steps: 100
+  
+  # Saving
+  save_strategy: "steps"
+  save_steps: 2000
+  save_total_limit: 1
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_NanoBEIR_mean_dot_ndcg@10"
+  greater_is_better: true
+  
+  # Push to HuggingFace Hub
+  push_to_hub: true
+  hub_model_id: "thivy/splade-regular-norbert4-scandinavian-multidataset"
+  hub_strategy: "checkpoint"
+  hub_private_repo: false
+  
+  # Logging
+  run_name: "splade-norbert4-regular-multidataset"
+  report_to: ["tensorboard", "mlflow"]
+  
+  # Data loading — CUDA multi-process data loading
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 4
+
+# ============================================================================
+# MLFLOW CONFIGURATION
+# ============================================================================
+mlflow:
+  tracking_uri: "mlruns"
+  experiment_name: "sparse-encoder-scandinavian"
+  tags:
+    project: "scandinavian-sparse-embeddings"
+    framework: "sentence-transformers"
+    architecture: "regular-splade"
+
+# ============================================================================
+# LOSS CONFIGURATION
+# ============================================================================
+loss:
+  type: "splade_loss"
+  inner_loss: "sparse_multiple_negatives_ranking_loss"
+  query_regularizer_weight: 0.0005  # 5e-4 — regular SPLADE needs query regularization
+  document_regularizer_weight: 0.003
+
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+datasets:
+  sampling_strategy: "round_robin"
+  
+  nli:
+    enabled: true
+    source: "Fremtind/all-nli-norwegian"
+    languages: ["norwegian"]
+    split_ratio: [0.98, 0.01, 0.01]
+  
+  scandi_qa:
+    enabled: true
+    use_norquad: true
+    use_openbookqa: true
+    use_scandiqa: true
+    use_supervised_da: true
+    use_paws: true
+    scandiqa_languages: ["no", "da", "sv"]
+    paws_data_dir: "data/paws-x/x-final"
+  
+  ddsc:
+    enabled: true
+    languages: ["norwegian", "danish", "swedish"]
+    tasks: null
+    split_ratio: [0.98, 0.01, 0.01]
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  evaluator: "sparse_nanobeir"
+  nanobeir_datasets: ["msmarco", "nfcorpus"]
+  mteb_tasks: ["NorQuAD", "SNL"]
+  track_sparsity: true
+  log_decoded_samples: 10
+
+# ============================================================================
+# MODEL CARD CONFIGURATION
+# ============================================================================
+model_card:
+  language: ["no", "da", "sv"]
+  license: "mit"
+  library_name: "sentence-transformers"
+  tags:
+    - "sparse-encoder"
+    - "splade"
+    - "regular-splade"
+    - "norwegian"
+    - "danish"
+    - "swedish"
+  model_name: "Regular SPLADE NorBERT4-large trained on Multi-dataset Norwegian/Scandinavian"
+  datasets_used:
+    - "Fremtind/all-nli-norwegian"
+    - "NorQuAD"
+    - "OpenBookQA"
+    - "ScandiQA"
+    - "DDSC Nordic Embedding Training Data"
+    - "PAWS-X Norwegian"
+
+# ============================================================================
+# HARDWARE CONFIGURATION — NVIDIA H100 NVL
+# ============================================================================
+hardware:
+  device: "cuda"
+  gradient_checkpointing: false
+  tf32: true
+  distributed: false
+  world_size: 1
