@@ -122,6 +122,7 @@ def evaluate_model(
                 model,
                 output_folder=output_dir,
                 batch_size=batch_size,
+                corpus_chunk_size=10000,  # Encode corpus in chunks to avoid OOM
                 overwrite_results=False,
             )
             
