@@ -62,6 +62,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress duplicate logs on non-main processes in DDP
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+if local_rank != 0:
+    logging.getLogger().setLevel(logging.WARNING)
+
+
+def is_main_process() -> bool:
+    """Check if this is the main process (rank 0) in distributed training."""
+    return int(os.environ.get("RANK", 0)) == 0
+
 
 def setup_hardware(config: dict) -> str:
     """
@@ -227,7 +237,66 @@ def create_sparse_model(config: dict) -> SparseEncoder:
         
         logger.info("Created regular SPLADE model")
     
+    # Patch norbert4's hardcoded use_reentrant=True for DDP compatibility
+    # norbert4 calls torch.utils.checkpoint.checkpoint(..., use_reentrant=True)
+    # which conflicts with DDP. We monkey-patch the encoder's forward to use
+    # use_reentrant=False instead.
+    _patch_norbert4_checkpointing(model)
+    
     return model
+
+
+def _patch_norbert4_checkpointing(model: SparseEncoder):
+    """
+    Patch norbert4 model's gradient checkpointing to use use_reentrant=False.
+    
+    The norbert4 model hardcodes use_reentrant=True in its encoder forward(),
+    which causes 'parameter marked ready twice' errors with DDP.
+    This patches the encoder to use use_reentrant=False.
+    """
+    import types
+    
+    # Find the encoder module inside the model
+    # Path: model[0].auto_model.encoder (for MLMTransformer-based models)
+    encoder = None
+    try:
+        if hasattr(model[0], 'auto_model'):
+            auto_model = model[0].auto_model
+            if hasattr(auto_model, 'encoder'):
+                encoder = auto_model.encoder
+            elif hasattr(auto_model, 'model') and hasattr(auto_model.model, 'encoder'):
+                encoder = auto_model.model.encoder
+    except (IndexError, AttributeError):
+        pass
+    
+    if encoder is None:
+        logger.info("No norbert4 encoder found to patch — skipping checkpointing patch")
+        return
+    
+    # Check if this encoder has the hardcoded use_reentrant=True pattern
+    original_forward = encoder.forward
+    
+    def patched_forward(self, hidden_layer, padding_info, output_hidden_states=False, checkpoint_activations=False):
+        hidden_layers = [hidden_layer] if output_hidden_states else None
+        v1 = None
+        embeddings = hidden_layer
+
+        for layer in self.layers:
+            if checkpoint_activations:
+                # Changed from use_reentrant=True to use_reentrant=False for DDP compatibility
+                hidden_layer, v1 = torch.utils.checkpoint.checkpoint(
+                    layer, hidden_layer, embeddings, v1, padding_info, use_reentrant=False
+                )
+            else:
+                hidden_layer, v1 = layer(hidden_layer, embeddings, v1, padding_info)
+
+            if output_hidden_states:
+                hidden_layers.append(hidden_layer)
+
+        return hidden_layer, hidden_layers
+    
+    encoder.forward = types.MethodType(patched_forward, encoder)
+    logger.info("Patched norbert4 encoder: use_reentrant=True → use_reentrant=False (DDP safe)")
 
 
 def create_model_card_data(config: dict) -> SparseEncoderModelCardData:
@@ -374,6 +443,12 @@ def create_training_args(config: dict) -> SparseEncoderTrainingArguments:
         
         # Memory optimization
         gradient_checkpointing=hardware_config.get('gradient_checkpointing', False),
+        gradient_checkpointing_kwargs={"use_reentrant": False} if hardware_config.get('gradient_checkpointing', False) else None,
+        
+        # DDP settings
+        # find_unused_parameters=True allows DDP to work even if some model parameters
+        # aren't used in every forward pass (e.g., router modules, frozen layers)
+        ddp_find_unused_parameters=True,
         
         # Batch sampling
         batch_sampler=batch_sampler,
@@ -646,8 +721,9 @@ def main(config: dict):
     # Setup hardware optimizations (TF32, cuDNN benchmark, etc.)
     device = setup_hardware(config)
     
-    # Setup MLflow experiment tracking
-    setup_mlflow(config)
+    # Setup MLflow experiment tracking (only on main process to avoid conflicts)
+    if is_main_process():
+        setup_mlflow(config)
     
     # Create output directory
     os.makedirs(config['training']['output_dir'], exist_ok=True)
@@ -658,8 +734,9 @@ def main(config: dict):
     logger.info("=" * 80)
     datasets = load_datasets(config)
     
-    # Log dataset statistics to MLflow
-    log_dataset_stats_to_mlflow(datasets)
+    # Log dataset statistics to MLflow (main process only)
+    if is_main_process():
+        log_dataset_stats_to_mlflow(datasets)
     
     # Prepare multi-dataset format
     train_dataset, eval_dataset = prepare_multi_dataset_dict(datasets)
@@ -743,8 +820,8 @@ def main(config: dict):
     logger.info("=" * 80)
     model.save_pretrained(final_model_path)
     
-    # Log model to MLflow
-    if mlflow.active_run():
+    # Log model to MLflow (main process only)
+    if is_main_process() and mlflow.active_run():
         logger.info("Logging model to MLflow...")
         mlflow.log_artifact(final_model_path, artifact_path="model")
         
@@ -757,7 +834,7 @@ def main(config: dict):
     logger.info("=" * 80)
     logger.info(f"Model saved to: {final_model_path}")
     
-    if mlflow.active_run():
+    if is_main_process() and mlflow.active_run():
         logger.info(f"MLflow run ID: {mlflow.active_run().info.run_id}")
         logger.info(f"MLflow tracking URI: {mlflow.get_tracking_uri()}")
         mlflow.end_run()
