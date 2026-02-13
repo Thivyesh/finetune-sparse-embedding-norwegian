@@ -98,6 +98,47 @@ def format_ddsc_for_sparse(dataset: Dataset) -> Dataset:
     return dataset
 
 
+def format_eti_for_sparse(dataset: Dataset) -> Dataset:
+    """
+    Format ETI (Elektronisk Tjenesteinformasjon) dataset for sparse encoder training.
+    
+    Input format: {anchor, positive, negative, source, language, task_type, mode}
+    Output format: {anchor, positive} or {anchor, positive, negative}
+    
+    The ETI dataset is already in the correct sparse encoder format with
+    anchor/positive/negative columns. We drop extra metadata columns (source,
+    language, task_type, mode) and remove the negative column if it contains
+    None values, since the downstream None-filter would discard those rows.
+    
+    Args:
+        dataset: Dataset with ETI data
+        
+    Returns:
+        Formatted dataset with only training-relevant columns
+    """
+    # Keep only the columns the trainer needs
+    keep_cols = ['anchor', 'positive']
+    if 'negative' in dataset.column_names:
+        keep_cols.append('negative')
+    
+    drop_cols = [c for c in dataset.column_names if c not in keep_cols]
+    if drop_cols:
+        dataset = dataset.remove_columns(drop_cols)
+        logger.info(f"ETI: dropped metadata columns {drop_cols}")
+    
+    # If the negative column exists but has None values, drop it entirely
+    # so the None-filter in prepare_multi_dataset_dict doesn't discard rows.
+    # The trainer will use in-batch negatives instead.
+    if 'negative' in dataset.column_names:
+        sample = dataset[0]
+        if sample.get('negative') is None:
+            dataset = dataset.remove_columns(['negative'])
+            logger.info("ETI: dropped 'negative' column (contains None values, will use in-batch negatives)")
+    
+    logger.info(f"ETI dataset formatted: {dataset.column_names}")
+    return dataset
+
+
 def prepare_multidataset_for_sparse(
     datasets_dict: Dict[str, Dataset],
     dataset_types: Dict[str, str]

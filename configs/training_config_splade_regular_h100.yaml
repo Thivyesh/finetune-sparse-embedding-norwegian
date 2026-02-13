@@ -10,6 +10,10 @@ model:
   architecture: "splade"
   pooling_strategy: "max"
   use_router: false
+  # Patch NorBERT4's sigmoid activation (30 * sigmoid(x/7.5)) for proper SPLADE sparsity.
+  # Without this, all logits are forced to (0, 30) → ReLU can never produce exact zeros.
+  # With this, raw logits range from ~-100 to +25 → SPLADE achieves true sparsity.
+  patch_sigmoid_for_sparsity: true
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -28,9 +32,15 @@ training:
   gradient_accumulation_steps: 1
   
   # Learning rate
+  # Official sbert MS MARCO SPLADE example uses 2e-5 with distilbert (30K vocab).
+  # We keep 2e-5 — this is standard and well-tested for SPLADE from scratch.
+  # The real problem was not LR but regularizer weights being too weak for 51K vocab.
   learning_rate: 0.00002  # 2e-5
   
   # Optimization
+  # LR warmup_ratio=0.1 is standard per sbert examples. The regularizer has its
+  # own separate warmup (quadratic over first 1/3 of training) handled by
+  # SpladeRegularizerWeightSchedulerCallback. These are independent schedules.
   warmup_ratio: 0.1
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -57,14 +67,20 @@ training:
   eval_steps: 1000  # Evaluate every 1000 steps
   logging_steps: 100
   
-  # Early stopping
-  early_stopping_patience: 3  # Stop if no improvement for 3 evaluations
-  early_stopping_threshold: 0.001  # Minimum improvement threshold
+  # Early stopping — DISABLED for this run
+  # The SpladeRegularizerWeightSchedulerCallback ramps regularization over the
+  # first 1/3 of training (~7.5K steps). This causes a temporary NDCG dip as the
+  # model learns to be sparse. With only 1 epoch, early stopping would kill
+  # training before the model can recover. The official sbert MS MARCO example
+  # also does NOT use early stopping.
+  # Re-enable after establishing a working baseline with proper sparsity.
+  # early_stopping_patience: 10
+  # early_stopping_threshold: 0.001
   
   # Saving
   save_strategy: "steps"
   save_steps: 1000  # Save checkpoint every 1000 steps (same as eval)
-  save_total_limit: 3  # Keep last 3 checkpoints (need multiple for early stopping)
+  save_total_limit: 5  # Keep last 5 checkpoints (load_best_model_at_end needs the best one kept)
   load_best_model_at_end: true  # Load best model at end of training
   metric_for_best_model: "NanoBEIR_mean_dot_ndcg@10"  # Metric from SparseNanoBEIREvaluator
   greater_is_better: true  # Higher NDCG is better
@@ -105,9 +121,18 @@ loss:
   # Regularization weights control sparsity (higher = sparser embeddings)
   # The SpladeRegularizerWeightSchedulerCallback (auto-added by trainer) ramps
   # these from 0 to max over the first 1/3 of training (quadratic schedule).
-  # Values based on SBERT MS MARCO MNRL example (asymmetric retrieval):
-  query_regularizer_weight: 0.00005  # 5e-5 — light query sparsity (queries are short)
-  document_regularizer_weight: 0.001  # 1e-3 — stronger document sparsity (docs need pruning)
+  #
+  # Official sbert examples use these values:
+  #   MS MARCO retrieval: query=5e-5, doc=1e-3 (distilbert, 30K vocab)
+  #   NLI finetuning:     doc=3e-3 (with use_document_regularizer_only)
+  #
+  # Previous run with query=5e-5, doc=1e-3 produced ZERO sparsity on NorBERT4
+  # (51K vocab) — all 51,200 dims remained active throughout training.
+  # FlopsLoss = sum(mean(embedding, dim=0)^2), so larger vocab = more terms
+  # in the sum = need stronger weight to push individual dims to zero.
+  # Using 3e-3 for documents, aligned with the NLI example.
+  query_regularizer_weight: 0.0001   # 1e-4 (up from 5e-5)
+  document_regularizer_weight: 0.003  # 3e-3 (up from 1e-3, matches sbert NLI example)
 
 # ============================================================================
 # DATASET CONFIGURATION
@@ -135,6 +160,11 @@ datasets:
     enabled: true
     languages: ["norwegian", "danish", "swedish"]
     tasks: null
+    split_ratio: [0.98, 0.01, 0.01]
+  
+  eti:
+    enabled: false  # ETI dataset from official health/welfare information
+    source: "thivy/eti-embedding-training-data"
     split_ratio: [0.98, 0.01, 0.01]
 
 # ============================================================================
@@ -167,6 +197,7 @@ model_card:
     - "ScandiQA"
     - "DDSC Nordic Embedding Training Data"
     - "PAWS-X Norwegian"
+    - "ETI (Elektronisk Tjenesteinformasjon)"
 
 # ============================================================================
 # HARDWARE CONFIGURATION — NVIDIA H100 NVL

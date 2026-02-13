@@ -1,0 +1,170 @@
+# ETI-Only SPLADE Fine-tuning Configuration — H100 GPU Optimized
+# Domain adaptation: Fine-tunes the Scandinavian SPLADE model on ETI health/welfare data
+# Base model: thivy/norbert4-base-splade-finetuned-scand (already SPLADE-trained)
+# Dataset: thivy/eti-embedding-training-data (~55K Norwegian health Q&A pairs)
+# Optimized for NVIDIA H100 NVL (96GB VRAM, CUDA 12.2, Compute Capability 9.0)
+# ============================================================================
+# MODEL CONFIGURATION
+# ============================================================================
+model:
+  base_model: "thivy/norbert4-base-splade-finetuned-scand"
+  architecture: "splade"
+  pooling_strategy: "max"
+  use_router: false
+  # Load the full pre-trained SparseEncoder directly (not just the base transformer).
+  # This preserves the SPLADE architecture (MLMTransformer + SpladePooling) and
+  # all learned weights from the Scandinavian multi-dataset training.
+  load_pretrained_sparse_encoder: true
+  # Patch NorBERT4's sigmoid activation (30 * sigmoid(x/7.5)) for proper SPLADE sparsity.
+  # Without this, all logits are forced to (0, 30) → ReLU can never produce exact zeros.
+  # With this, raw logits range from ~-100 to +25 → SPLADE achieves true sparsity.
+  patch_sigmoid_for_sparsity: true
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  output_dir: "models/splade-norbert4-base-eti"
+  
+  # Training duration — small dataset (~55K), 3 epochs for domain adaptation
+  num_train_epochs: 3
+  
+  # Batch sizes — norbert4-base (149M) well within single H100 capacity
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 1
+  
+  # Learning rate — lower than from-scratch training for domain adaptation
+  # The model is already well-trained; we want gentle adaptation, not disruption.
+  learning_rate: 0.00001  # 1e-5 (half of the 2e-5 used for from-scratch)
+  
+  # Optimization
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  # Precision — H100 has hardware BF16 Tensor Cores
+  fp16: false
+  bf16: true
+  
+  # Torch compile — disabled due to variable sequence lengths causing recompilation
+  torch_compile: false
+  
+  # Sequence length — ETI documents can be long (health articles)
+  max_seq_length: 4096
+  
+  # Batch sampling
+  batch_sampler: "batch_sampler"
+  
+  # Evaluation — more frequent for small dataset
+  eval_strategy: "steps"
+  eval_steps: 500
+  logging_steps: 50
+  
+  # Early stopping — safe to use for domain adaptation (no regularizer ramp-up concern)
+  # The model already has good sparsity from pre-training.
+  early_stopping_patience: 5
+  early_stopping_threshold: 0.001
+  
+  # Saving
+  save_strategy: "steps"
+  save_steps: 500
+  save_total_limit: 2
+  load_best_model_at_end: true
+  metric_for_best_model: "NanoBEIR_mean_dot_ndcg@10"
+  greater_is_better: true
+  
+  # Push to HuggingFace Hub
+  push_to_hub: true
+  hub_model_id: "thivy/norbert4-base-splade-eti"
+  hub_strategy: "checkpoint"
+  hub_private_repo: false
+  
+  # Logging
+  run_name: "splade-norbert4-base-eti"
+  report_to: ["tensorboard", "mlflow"]
+  
+  # Data loading
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+# ============================================================================
+# MLFLOW CONFIGURATION
+# ============================================================================
+mlflow:
+  tracking_uri: "mlruns"
+  experiment_name: "sparse-encoder-eti"
+  tags:
+    project: "scandinavian-sparse-embeddings"
+    framework: "sentence-transformers"
+    architecture: "regular-splade"
+    domain: "health-welfare"
+
+# ============================================================================
+# LOSS CONFIGURATION
+# ============================================================================
+loss:
+  type: "splade_loss"
+  inner_loss: "sparse_multiple_negatives_ranking_loss"
+  # Keep same regularization weights as the base model was trained with.
+  # Domain adaptation should maintain the sparsity characteristics.
+  query_regularizer_weight: 0.0001   # 1e-4
+  document_regularizer_weight: 0.003  # 3e-3
+
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+datasets:
+  sampling_strategy: "round_robin"
+  
+  nli:
+    enabled: false
+  
+  scandi_qa:
+    enabled: false
+  
+  ddsc:
+    enabled: false
+  
+  eti:
+    enabled: true
+    source: "thivy/eti-embedding-training-data"
+    split_ratio: [0.98, 0.01, 0.01]
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  evaluator: "sparse_nanobeir"
+  nanobeir_datasets:
+    - "nfcorpus"  # Health-related benchmark — good proxy for ETI domain
+
+# ============================================================================
+# MODEL CARD CONFIGURATION
+# ============================================================================
+model_card:
+  language: ["no"]
+  license: "mit"
+  library_name: "sentence-transformers"
+  tags:
+    - "sparse-encoder"
+    - "splade"
+    - "regular-splade"
+    - "norwegian"
+    - "health"
+    - "welfare"
+    - "domain-adaptation"
+  model_name: "SPLADE NorBERT4-base fine-tuned on ETI Norwegian Health/Welfare Data"
+  datasets_used:
+    - "ETI (Elektronisk Tjenesteinformasjon)"
+
+# ============================================================================
+# HARDWARE CONFIGURATION — NVIDIA H100 NVL
+# ============================================================================
+hardware:
+  device: "cuda"
+  gradient_checkpointing: true
+  tf32: true
+  distributed: false
+  world_size: 1

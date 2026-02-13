@@ -46,12 +46,14 @@ from sentence_transformers.training_args import BatchSamplers, MultiDatasetBatch
 from utils.data_loader_nli import load_nli_data
 from utils.data_loader_ddsc import load_ddsc_data
 from utils.data_loader_scandi_qa import load_scandi_qa_data
+from utils.data_loader_eti import load_eti_data
 
 # Import local utilities
 from utils.sparse_data_formatter import (
     format_nli_for_sparse,
     format_qa_for_sparse,
     format_ddsc_for_sparse,
+    format_eti_for_sparse,
     validate_sparse_dataset,
 )
 
@@ -147,6 +149,7 @@ def create_sparse_model(config: dict) -> SparseEncoder:
     Create sparse encoder model based on configuration.
     
     Supports:
+    - Loading a pre-trained SparseEncoder (for domain adaptation / continued fine-tuning)
     - Regular SPLADE: MLMTransformer + SpladePooling
     - Inference-free SPLADE: Router with query (static) + document (MLM) paths
     - CSR: Dense Transformer + Pooling + SparseAutoEncoder
@@ -156,6 +159,26 @@ def create_sparse_model(config: dict) -> SparseEncoder:
     architecture = model_config['architecture']
     
     logger.info(f"Creating {architecture} model from {base_model}")
+    
+    # If load_pretrained_sparse_encoder is set, load an existing SparseEncoder
+    # directly (for domain adaptation / continued fine-tuning).
+    if model_config.get('load_pretrained_sparse_encoder', False):
+        logger.info(f"Loading pre-trained SparseEncoder from {base_model}")
+        model = SparseEncoder(
+            base_model,
+            trust_remote_code=True,
+            model_card_data=create_model_card_data(config),
+        )
+        logger.info(f"Loaded pre-trained SparseEncoder: {model}")
+        
+        # Patch norbert4's hardcoded use_reentrant=True for DDP compatibility
+        _patch_norbert4_checkpointing(model)
+        
+        # Optionally patch sigmoid for sparsity
+        if model_config.get('patch_sigmoid_for_sparsity', False):
+            _patch_norbert4_sigmoid_for_sparsity(model, patch_sigmoid=True)
+        
+        return model
     
     if architecture == "inference-free-splade":
         # Inference-free: Static embeddings for queries, MLM for documents
@@ -243,6 +266,12 @@ def create_sparse_model(config: dict) -> SparseEncoder:
     # use_reentrant=False instead.
     _patch_norbert4_checkpointing(model)
     
+    # Optionally patch norbert4's sigmoid activation for proper SPLADE sparsity
+    # This removes the sigmoid that forces logits to (0, 30) range, allowing
+    # SPLADE's ReLU to produce exact zeros for true sparsity metrics.
+    patch_sigmoid = model_config.get('patch_sigmoid_for_sparsity', True)
+    _patch_norbert4_sigmoid_for_sparsity(model, patch_sigmoid=patch_sigmoid)
+    
     return model
 
 
@@ -297,6 +326,98 @@ def _patch_norbert4_checkpointing(model: SparseEncoder):
     
     encoder.forward = types.MethodType(patched_forward, encoder)
     logger.info("Patched norbert4 encoder: use_reentrant=True → use_reentrant=False (DDP safe)")
+
+
+def _patch_norbert4_sigmoid_for_sparsity(model: SparseEncoder, patch_sigmoid: bool = True):
+    """
+    Patch norbert4's sigmoid activation in the MLM head for proper sparsity.
+    
+    NorBERT4's GptBertForMaskedLM.forward() applies: logits = 30 * sigmoid(x/7.5)
+    This forces all logits to (0, 30) range, preventing SPLADE's ReLU from producing
+    exact zeros. This patch removes the sigmoid so logits can be negative, enabling
+    true sparsity.
+    
+    Args:
+        model: SparseEncoder model to patch
+        patch_sigmoid: If True, remove sigmoid. If False, keep original.
+    """
+    if not patch_sigmoid:
+        logger.info("Sigmoid patching disabled — model will have 0% metric sparsity")
+        return
+    
+    import types
+    from transformers.modeling_outputs import MaskedLMOutput
+    
+    # The sigmoid is in auto_model.forward(), not in a sub-module
+    auto_model = None
+    try:
+        if hasattr(model[0], 'auto_model'):
+            auto_model = model[0].auto_model
+    except (IndexError, AttributeError):
+        pass
+    
+    if auto_model is None:
+        logger.warning("No norbert4 auto_model found — sigmoid patching skipped")
+        return
+    
+    # Verify this is GptBertForMaskedLM
+    if type(auto_model).__name__ != 'GptBertForMaskedLM':
+        logger.info(f"Model is {type(auto_model).__name__}, not GptBertForMaskedLM — skipping sigmoid patch")
+        return
+    
+    original_forward = auto_model.forward
+    
+    def patched_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        output_hidden_states=None,
+        return_dict=None,
+        labels=None,
+        **kwargs
+    ):
+        """GptBertForMaskedLM.forward() without sigmoid activation."""
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        sequence_output, contextualized_embeddings = self.get_contextualized_embeddings(
+            input_ids, attention_mask, output_hidden_states
+        )
+        subword_prediction = self.classifier(sequence_output)
+        
+        # PATCH: Skip the sigmoid activation
+        # Original: subword_prediction = 30 * torch.sigmoid(subword_prediction / 7.5)
+        # Raw logits allow SPLADE's ReLU to produce exact zeros for true sparsity
+
+        masked_lm_loss = None
+        if labels is not None:
+            labels_flatten = labels[:, 1:].flatten()
+            subword_prediction_flatten = subword_prediction[:, :-1].flatten(0, 1)
+            masked_lm_loss = torch.nn.functional.cross_entropy(
+                subword_prediction_flatten, labels_flatten
+            )
+
+        bos_logits = torch.zeros(
+            subword_prediction.size(0), 1, self.config.vocab_size,
+            dtype=subword_prediction.dtype, device=subword_prediction.device
+        )
+        bos_logits[:, :, self.config.bos_token_id] = 1.0
+        subword_prediction = torch.cat([bos_logits, subword_prediction[:, :-1]], dim=1)
+
+        if not return_dict:
+            output = (
+                subword_prediction,
+                *([contextualized_embeddings] if output_hidden_states else [])
+            )
+            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+
+        return MaskedLMOutput(
+            loss=masked_lm_loss,
+            logits=subword_prediction,
+            hidden_states=contextualized_embeddings if output_hidden_states else None
+        )
+    
+    auto_model.forward = types.MethodType(patched_forward, auto_model)
+    logger.info("✓ Patched norbert4 MLM head: removed sigmoid activation for SPLADE sparsity")
 
 
 def create_model_card_data(config: dict) -> SparseEncoderModelCardData:
@@ -395,6 +516,29 @@ def load_datasets(config: dict) -> Dict[str, DatasetDict]:
         })
         
         logger.info(f"DDSC loaded: {len(ddsc_train)} train, {len(ddsc_dev)} dev, {len(ddsc_test)} test")
+    
+    # Load ETI data
+    if dataset_config.get('eti', {}).get('enabled', False):
+        logger.info("Loading ETI dataset...")
+        eti_config = dataset_config['eti']
+        
+        eti_train, eti_dev, eti_test = load_eti_data(
+            dataset_name=eti_config.get('source', 'thivy/eti-embedding-training-data'),
+            split_ratio=tuple(eti_config.get('split_ratio', [0.98, 0.01, 0.01])),
+        )
+        
+        # Format for sparse encoder
+        eti_train = format_eti_for_sparse(eti_train)
+        eti_dev = format_eti_for_sparse(eti_dev)
+        eti_test = format_eti_for_sparse(eti_test)
+        
+        datasets['eti'] = DatasetDict({
+            'train': eti_train,
+            'eval': eti_dev,
+            'test': eti_test,
+        })
+        
+        logger.info(f"ETI loaded: {len(eti_train)} train, {len(eti_dev)} dev, {len(eti_test)} test")
     
     # Validate all datasets
     for name, dataset_dict in datasets.items():
