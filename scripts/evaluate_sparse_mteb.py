@@ -27,17 +27,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Scandinavian MTEB tasks
+# Scandinavian MTEB Retrieval Tasks (optimized for sparse encoders)
 SCANDINAVIAN_TASKS = {
     "norwegian": [
-        "NorQuAD",  # Norwegian question answering
-        "SNL",      # Norwegian language retrieval
+        "NorQuadRetrieval",           # Norwegian question answering retrieval
+        "SNLRetrieval",                # Norwegian language retrieval (Store Norske Leksikon)
+        "WebFAQRetrieval",             # Multilingual FAQ retrieval (includes nno, nob, nor)
+        "WikipediaRetrievalMultilingual",  # Wikipedia retrieval (includes Norwegian)
     ],
     "danish": [
-        # Add Danish tasks if available
+        "DanFeverRetrieval",           # Danish fact verification retrieval
+        "TV2Nordretrieval",            # Danish news retrieval
+        "TwitterHjerneRetrieval",      # Danish Twitter retrieval
     ],
     "swedish": [
-        # Add Swedish tasks if available
+        "SweFaqRetrieval",             # Swedish FAQ retrieval
+        "SwednRetrieval",              # Swedish news retrieval
+    ],
+    "multilingual": [
+        "MKQARetrieval",               # Multilingual QA (includes Norwegian)
     ],
 }
 
@@ -63,7 +71,7 @@ def evaluate_model(
     
     # Load model
     logger.info(f"Loading model from: {model_path}")
-    model = SparseEncoder(model_path)
+    model = SparseEncoder(model_path, trust_remote_code=True)
     logger.info(f"Model loaded: {model}")
     
     # Default to Norwegian tasks if none specified
@@ -85,15 +93,36 @@ def evaluate_model(
         logger.info("=" * 80)
         
         try:
-            # Load task
-            task = mteb.get_task(task_name)
+            # Try to load task, filtering multilingual tasks to Norwegian only
+            try:
+                task = mteb.get_task(task_name)
+                
+                # For multilingual tasks, filter to Norwegian only
+                if hasattr(task, 'hf_subsets') and len(task.hf_subsets) > 5:
+                    norwegian_subsets = {'nob', 'nno', 'nor', 'no', 'nb', 'nn'}
+                    norwegian_keys = {k for k in task.metadata.eval_langs if k in norwegian_subsets}
+                    if norwegian_keys:
+                        logger.info(f"Multilingual task with {len(task.metadata.eval_langs)} subsets")
+                        # Must update BOTH eval_langs (for load_data) and hf_subsets (for evaluation)
+                        task.metadata.eval_langs = {k: task.metadata.eval_langs[k] for k in norwegian_keys}
+                        task.hf_subsets = sorted(norwegian_keys)
+                        logger.info(f"Filtered to Norwegian only: {task.hf_subsets}")
+                    else:
+                        logger.info(f"No Norwegian subset found, using all subsets")
+                
+            except KeyError:
+                logger.warning(f"Task '{task_name}' not found in MTEB registry. Skipping...")
+                logger.info(f"Available tasks can be queried via mteb.get_all_tasks()")
+                results[task_name] = {"skipped": f"Task not found in MTEB registry"}
+                continue
             
-            # Run evaluation
+            # Run evaluation with sparse model (all tasks are retrieval)
             evaluation = mteb.MTEB(tasks=[task])
             task_results = evaluation.run(
                 model,
                 output_folder=output_dir,
                 batch_size=batch_size,
+                corpus_chunk_size=10000,  # Encode corpus in chunks to avoid OOM
                 overwrite_results=False,
             )
             
@@ -125,8 +154,29 @@ def evaluate_model(
     model_name = Path(model_path).parent.name
     results_file = os.path.join(output_dir, f"{model_name}_summary_{timestamp}.json")
     
+    # Convert results to JSON-serializable format (handle numpy types)
+    def convert_to_serializable(obj):
+        """Recursively convert numpy types to native Python types."""
+        import numpy as np
+        if isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif hasattr(obj, '__dict__') and not isinstance(obj, (str, int, float, bool)):
+            return str(obj)
+        else:
+            return obj
+    
+    serializable_results = convert_to_serializable(results)
+    
     with open(results_file, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(serializable_results, f, indent=2)
     
     logger.info("\n" + "=" * 80)
     logger.info("EVALUATION COMPLETE")
@@ -139,7 +189,9 @@ def evaluate_model(
     logger.info("=" * 80)
     
     for task_name, task_result in results.items():
-        if "error" in task_result:
+        if "skipped" in task_result:
+            logger.info(f"{task_name}: SKIPPED - {task_result['skipped']}")
+        elif "error" in task_result:
             logger.info(f"{task_name}: ERROR - {task_result['error']}")
         elif task_name in task_result and 'test' in task_result[task_name]:
             test_scores = task_result[task_name]['test']
@@ -210,7 +262,7 @@ def analyze_sparsity(model_path: str, sample_texts: list = None):
     logger.info("SPARSITY ANALYSIS")
     logger.info("=" * 80)
     
-    model = SparseEncoder(model_path)
+    model = SparseEncoder(model_path, trust_remote_code=True)
     
     if sample_texts is None:
         sample_texts = [
@@ -222,34 +274,63 @@ def analyze_sparsity(model_path: str, sample_texts: list = None):
     
     logger.info(f"Analyzing sparsity on {len(sample_texts)} sample texts\n")
     
-    # Encode samples
-    embeddings = model.encode(sample_texts, convert_to_sparse_tensor=True)
-    
-    vocab_size = embeddings.shape[1]
-    
-    for i, (text, embedding) in enumerate(zip(sample_texts, embeddings)):
-        # Count non-zero dimensions
-        active_dims = (embedding != 0).sum()
-        sparsity = (1 - active_dims / vocab_size) * 100
+    try:
+        # Encode samples
+        embeddings = model.encode(sample_texts, convert_to_sparse_tensor=True)
         
-        logger.info(f"Sample {i+1}: {text}")
-        logger.info(f"  Active dimensions: {active_dims} / {vocab_size}")
-        logger.info(f"  Sparsity: {sparsity:.2f}%")
+        vocab_size = embeddings.shape[1]
         
-        # Decode top-k tokens
-        decoded = model.decode(embedding, top_k=10)
-        logger.info(f"  Top-10 tokens: {decoded}")
-        logger.info("")
-    
-    # Overall statistics
-    total_active = sum((emb != 0).sum() for emb in embeddings)
-    avg_active = total_active / len(embeddings)
-    avg_sparsity = (1 - avg_active / vocab_size) * 100
-    
-    logger.info("=" * 80)
-    logger.info(f"AVERAGE SPARSITY: {avg_sparsity:.2f}%")
-    logger.info(f"AVERAGE ACTIVE DIMENSIONS: {avg_active:.1f} / {vocab_size}")
-    logger.info("=" * 80)
+        for i, (text, embedding) in enumerate(zip(sample_texts, embeddings)):
+            try:
+                # Convert to dense for analysis (sparse tensors have limited operations)
+                if hasattr(embedding, 'to_dense'):
+                    embedding_dense = embedding.to_dense()
+                else:
+                    embedding_dense = embedding
+                
+                # Count non-zero dimensions
+                active_dims = (embedding_dense != 0).sum().item()
+                sparsity = (1 - active_dims / vocab_size) * 100
+                
+                logger.info(f"Sample {i+1}: {text}")
+                logger.info(f"  Active dimensions: {active_dims} / {vocab_size}")
+                logger.info(f"  Sparsity: {sparsity:.2f}%")
+                logger.info(f"  Max value: {embedding_dense.max():.4f}")
+                logger.info(f"  Min value: {embedding_dense.min():.4f}")
+                
+                # Decode top-k tokens (only if embedding has enough info)
+                try:
+                    decoded = model.decode(embedding.unsqueeze(0) if embedding.dim() == 1 else embedding, top_k=10)
+                    logger.info(f"  Top-10 tokens: {decoded[0][:5] if decoded else 'N/A'}")
+                except Exception as decode_err:
+                    logger.info(f"  Could not decode tokens: {decode_err}")
+                
+                logger.info("")
+            except Exception as emb_err:
+                logger.error(f"  Error analyzing embedding {i}: {emb_err}")
+        
+        # Overall statistics
+        try:
+            total_active = 0
+            for emb in embeddings:
+                if hasattr(emb, 'to_dense'):
+                    emb_dense = emb.to_dense()
+                else:
+                    emb_dense = emb
+                total_active += (emb_dense != 0).sum().item()
+            
+            avg_active = total_active / len(embeddings)
+            avg_sparsity = (1 - avg_active / vocab_size) * 100
+            
+            logger.info("=" * 80)
+            logger.info(f"AVERAGE SPARSITY: {avg_sparsity:.2f}%")
+            logger.info(f"AVERAGE ACTIVE DIMENSIONS: {avg_active:.0f} / {vocab_size}")
+            logger.info("=" * 80)
+        except Exception as stats_err:
+            logger.error(f"Error computing sparsity stats: {stats_err}")
+            
+    except Exception as e:
+        logger.error(f"Error in sparsity analysis: {e}")
 
 
 def main():
